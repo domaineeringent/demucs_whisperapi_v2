@@ -1,8 +1,8 @@
 demucs
 gradio
---extra-index-url https://download.pytorch.org/whl/cu126
-torch
-torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch>=2.2.0
+torchaudio>=2.2.0
 numpy
 ffmpeg-python
 openai-whisper
