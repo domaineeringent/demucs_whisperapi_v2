@@ -1,5 +1,5 @@
-# Use CUDA 12.4 for optimal compatibility and performance
-FROM nvidia/cuda:12.4.0-cudnn8-devel-ubuntu22.04
+# Use CUDA 12.4.1 for optimal compatibility and performance
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
