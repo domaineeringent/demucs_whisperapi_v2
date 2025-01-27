@@ -1,5 +1,5 @@
-# Use latest CUDA 12.6.3 for best performance
-FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+# Use CUDA 12.4 for optimal compatibility and performance
+FROM nvidia/cuda:12.4.0-cudnn8-devel-ubuntu22.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DEMUCS_HOME=/app/models \
     TRANSFORMERS_CACHE=/app/transformers \
     CUDA_AUTO_TUNE=1 \
-    TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0" \
+    TORCH_CUDA_ARCH_LIST="8.6;8.9" \
     CUDA_MODULE_LOADING=LAZY
 
 # Install system dependencies
