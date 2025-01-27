@@ -40,36 +40,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY app.py .
 
-# Pre-download models without CUDA optimization (will optimize at runtime)
+# Pre-download and cache models (simple version, no optimization)
 RUN python3 -c "\
+import torch; \
 import os; \
-import sys; \
-\
-try: \
-    # Set environment \
-    os.environ['TORCH_HOME'] = '/app/torch'; \
-    os.environ['TRANSFORMERS_CACHE'] = '/app/transformers'; \
-    \
-    print('Downloading models (CUDA optimization will happen at runtime)...'); \
-    \
-    # Download Demucs model \
-    print('Downloading Demucs model...'); \
-    from demucs.pretrained import get_model; \
-    model = get_model('htdemucs_ft'); \
-    print('Demucs model downloaded successfully'); \
-    \
-    # Download Whisper model \
-    print('Downloading Whisper model...'); \
-    import whisper; \
-    whisper_model = whisper.load_model('turbo'); \
-    print('Whisper model downloaded successfully'); \
-    \
-    print('All models downloaded successfully. CUDA optimization will occur at startup.'); \
-    \
-except Exception as e: \
-    print(f'Error during model download: {str(e)}', file=sys.stderr); \
-    sys.exit(1) \
-"
+os.environ['TORCH_HOME'] = '/app/torch'; \
+os.environ['TRANSFORMERS_CACHE'] = '/app/transformers'; \
+from demucs.pretrained import get_model; \
+import whisper; \
+print('Downloading and caching models...'); \
+get_model('htdemucs_ft'); \
+whisper.load_model('turbo'); \
+print('Model caching complete.')"
 
 # Create startup script for runtime CUDA optimization
 RUN echo '\
@@ -87,19 +69,25 @@ def optimize_models():\n\
         gc.collect()\n\
         \n\
         # Optimize Demucs\n\
+        print("Loading Demucs model...")\n\
         model = get_model("htdemucs_ft")\n\
         model.cuda()\n\
         with torch.cuda.amp.autocast():\n\
             with torch.no_grad():\n\
                 dummy_input = torch.randn(2, 44100).cuda()\n\
                 _ = model(dummy_input.unsqueeze(0))\n\
+        del model\n\
         torch.cuda.empty_cache()\n\
+        gc.collect()\n\
         \n\
         # Optimize Whisper\n\
+        print("Loading Whisper model...")\n\
         whisper_model = whisper.load_model("turbo")\n\
         dummy_audio = whisper.pad_or_trim(torch.randn(16000))\n\
         whisper_model.transcribe(dummy_audio)\n\
+        del whisper_model\n\
         torch.cuda.empty_cache()\n\
+        gc.collect()\n\
         \n\
         print("CUDA optimization complete")\n\
     else:\n\
@@ -117,4 +105,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Set the default command to run the application with CUDA optimization at startup
-CMD python3 /app/optimize_cuda.py && python3 -m uvicorn app:app --host 0.0.0.0 --port 8000
+CMD ["sh", "-c", "python3 /app/optimize_cuda.py && python3 -m uvicorn app:app --host 0.0.0.0 --port 8000"]
