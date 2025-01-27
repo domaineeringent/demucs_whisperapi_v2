@@ -21,6 +21,7 @@ from queue import Queue
 import asyncio
 import requests
 import time
+import aiohttp
 
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
@@ -62,7 +63,8 @@ request_queue = Queue(maxsize=50)  # Allow up to 50 queued requests
 # -------------------- RUNPOD CONFIG -------------------- #
 RUNPOD_API_KEY = os.getenv('RUNPOD_API_KEY')
 POD_ID = os.getenv('RUNPOD_POD_ID')
-IDLE_SHUTDOWN_SECONDS = 300  # 5 minutes of inactivity before shutdown
+IDLE_SHUTDOWN_SECONDS = 60  # 1 minutes of inactivity before shutdown
+RUNPOD_API_URL = "https://api.runpod.io/graphql"  # Change to GraphQL endpoint
 
 # Track last activity
 last_activity_time = time.time()
@@ -102,19 +104,41 @@ async def manual_shutdown():
         )
     
     try:
-        response = requests.post(
-            f"https://api.runpod.io/v2/pod/{POD_ID}/stop",
-            headers={
-                "Authorization": f"Bearer {RUNPOD_API_KEY}"
+        query = """
+        mutation StopPod($podId: String!) {
+            podStop(input: {podId: $podId}) {
+                id
+                desiredStatus
             }
-        )
-        if response.status_code == 200:
-            return {"status": "success", "message": "Shutdown initiated"}
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"RunPod API error: {response.text}"
-            )
+        }
+        """
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                RUNPOD_API_URL,
+                json={
+                    "query": query,
+                    "variables": {"podId": POD_ID}
+                },
+                headers={
+                    "Authorization": f"Bearer {RUNPOD_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if "errors" not in data:
+                        return {"status": "success", "message": "Shutdown initiated"}
+                    else:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"GraphQL error: {data['errors']}"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"RunPod API error: {await response.text()}"
+                    )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -627,17 +651,36 @@ async def check_idle_and_shutdown():
             
             if RUNPOD_API_KEY and POD_ID:
                 try:
-                    # Call RunPod API to terminate pod
-                    response = requests.post(
-                        f"https://api.runpod.io/v2/pod/{POD_ID}/stop",
-                        headers={
-                            "Authorization": f"Bearer {RUNPOD_API_KEY}"
+                    # Use GraphQL mutation to stop pod
+                    query = """
+                    mutation StopPod($podId: String!) {
+                        podStop(input: {podId: $podId}) {
+                            id
+                            desiredStatus
                         }
-                    )
-                    if response.status_code == 200:
-                        logging.info("RunPod shutdown request successful")
-                    else:
-                        logging.error(f"RunPod API error: {response.text}")
+                    }
+                    """
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            RUNPOD_API_URL,
+                            json={
+                                "query": query,
+                                "variables": {"podId": POD_ID}
+                            },
+                            headers={
+                                "Authorization": f"Bearer {RUNPOD_API_KEY}",
+                                "Content-Type": "application/json"
+                            }
+                        ) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                if "errors" not in data:
+                                    logging.info("RunPod shutdown request successful")
+                                else:
+                                    logging.error(f"GraphQL error: {data['errors']}")
+                            else:
+                                logging.error(f"RunPod API error: {await response.text()}")
                 except Exception as e:
                     logging.error(f"Error during RunPod shutdown: {e}")
             else:
