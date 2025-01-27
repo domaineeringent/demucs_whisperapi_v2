@@ -1,6 +1,9 @@
 # Use CUDA 12.4.1 for optimal compatibility and performance
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
+# Add build-time argument to force cache invalidation
+ARG CACHE_BUST=$(date +%s)
+
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -60,6 +63,7 @@ import torch\n\
 import os\n\
 import gc\n\
 from demucs.pretrained import get_model\n\
+from demucs.apply import apply_model\n\
 import whisper\n\
 \n\
 def optimize_models():\n\
@@ -72,10 +76,10 @@ def optimize_models():\n\
         print("Loading Demucs model...")\n\
         model = get_model("htdemucs_ft")\n\
         model.cuda()\n\
-        with torch.cuda.amp.autocast():\n\
+        with torch.amp.autocast("cuda"):\n\
             with torch.no_grad():\n\
                 dummy_input = torch.randn(2, 44100).cuda()\n\
-                _ = model(dummy_input.unsqueeze(0))\n\
+                _ = apply_model(model, dummy_input.unsqueeze(0), split=True)\n\
         del model\n\
         torch.cuda.empty_cache()\n\
         gc.collect()\n\
