@@ -51,14 +51,30 @@ app_state = {"status": "installing", "detail": "Starting installation"}
 # Memory management settings
 DEMUCS_VRAM_GB = 6  # Approximate VRAM per Demucs job
 WHISPER_VRAM_GB = 2  # Approximate VRAM for Whisper
-TOTAL_VRAM_GB = 16  # RTX 4080 SUPER
+TOTAL_VRAM_GB = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
 
-# Semaphore to limit concurrent jobs
-MAX_CONCURRENT_JOBS = 3  # Can safely run 3 concurrent jobs (6GB * 2 for Demucs + 2GB for Whisper)
+# Dynamically calculate max concurrent jobs based on available VRAM
+MAX_CONCURRENT_JOBS = max(1, min(3, int(TOTAL_VRAM_GB / (DEMUCS_VRAM_GB + 0.5))))  # Add 0.5GB buffer per job
 gpu_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
 
-# Queue for managing batch requests
-request_queue = Queue(maxsize=50)  # Allow up to 50 queued requests
+# Queue for managing batch requests with timeout
+class TimedQueue(Queue):
+    def put(self, item, timeout=300):  # 5 minute timeout
+        super().put(item)
+        # Schedule item removal if not processed
+        asyncio.create_task(self._remove_after_timeout(item, timeout))
+    
+    async def _remove_after_timeout(self, item, timeout):
+        await asyncio.sleep(timeout)
+        try:
+            with self.mutex:
+                if item in self.queue:
+                    self.queue.remove(item)
+                    logging.warning(f"Removed timed out item from queue: {item}")
+        except Exception as e:
+            logging.error(f"Error removing timed out item: {e}")
+
+request_queue = TimedQueue(maxsize=50)  # Allow up to 50 queued requests
 
 # -------------------- RUNPOD CONFIG -------------------- #
 RUNPOD_API_KEY = os.getenv('RUNPOD_API_KEY')
@@ -519,9 +535,19 @@ async def api_transcribe(file: UploadFile = File(...)):
         temp_filename = ''.join(random.choices(string.ascii_letters + string.digits, k=12)) + "_" + file.filename
         temp_filepath = os.path.join("/tmp", temp_filename)
 
-        # Save the uploaded file
-        with open(temp_filepath, "wb") as temp_audio:
-            temp_audio.write(await file.read())
+        # Save the uploaded file in chunks to handle large files
+        CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+        try:
+            with open(temp_filepath, "wb") as temp_audio:
+                while chunk := await file.read(CHUNK_SIZE):
+                    temp_audio.write(chunk)
+        except Exception as e:
+            if os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Error saving uploaded file: {str(e)}"
+            )
 
         # If system is still installing but queue isn't full, accept the request
         if app_state["status"] == "installing":
@@ -566,22 +592,30 @@ async def api_transcribe(file: UploadFile = File(...)):
             )
 
         try:
-            # Process the audio pipeline
-            status, final_zip = process_audio_pipeline(
-                temp_filepath,
-                ft_shifts=2,
-                ft_overlap=0.25
+            # Process the audio pipeline with increased timeouts
+            status, final_zip = await asyncio.wait_for(
+                asyncio.to_thread(process_audio_pipeline, temp_filepath, ft_shifts=2, ft_overlap=0.25),
+                timeout=600  # 10 minute timeout for processing
             )
+
+            if not final_zip or not os.path.exists(final_zip):
+                raise HTTPException(status_code=500, detail="Processing failed to produce output")
 
             if "error" in status.lower():
                 raise HTTPException(status_code=500, detail=status)
 
+            # Stream the response back in chunks
             return FileResponse(
                 final_zip,
                 media_type='application/zip',
                 filename=os.path.basename(final_zip)
             )
 
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Processing timed out after 10 minutes"
+            )
         finally:
             # Clean up and release semaphore
             if os.path.exists(temp_filepath):
@@ -595,33 +629,49 @@ async def api_transcribe(file: UploadFile = File(...)):
 
     except Exception as e:
         logging.error(f"API error: {e}", exc_info=True)
+        # Clean up on error
+        if os.path.exists(temp_filepath):
+            os.remove(temp_filepath)
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_queued_request(filepath: str):
-    """Process a queued request asynchronously."""
+    """Process a queued request asynchronously with better error handling and memory management."""
     update_activity()  # Track activity
     acquired = False
     try:
         acquired = gpu_semaphore.acquire(blocking=True)
-        status, final_zip = process_audio_pipeline(
-            filepath,
-            ft_shifts=2,
-            ft_overlap=0.25
-        )
-        # Store result for later retrieval
-        # You could implement a results cache here
+        clear_gpu_memory()  # Clear memory before processing
         
+        # Process with timeout
+        status, final_zip = await asyncio.wait_for(
+            asyncio.to_thread(process_audio_pipeline, filepath, ft_shifts=2, ft_overlap=0.25),
+            timeout=600  # 10 minute timeout
+        )
+        
+        if final_zip and os.path.exists(final_zip):
+            logging.info(f"Successfully processed queued file: {filepath}")
+            # Here you could implement a result cache or notification system
+        else:
+            logging.error(f"Failed to process queued file: {filepath}")
+            
+    except asyncio.TimeoutError:
+        logging.error(f"Processing timeout for queued file: {filepath}")
     except Exception as e:
         logging.error(f"Queue processing error: {e}", exc_info=True)
     finally:
         if acquired:
+            clear_gpu_memory()  # Clear memory after processing
             gpu_semaphore.release()
         if os.path.exists(filepath):
             os.remove(filepath)
         # Process next item in queue if any
         if not request_queue.empty():
-            next_file = request_queue.get()
-            asyncio.create_task(process_queued_request(next_file))
+            try:
+                next_file = request_queue.get_nowait()
+                if next_file and os.path.exists(next_file):
+                    asyncio.create_task(process_queued_request(next_file))
+            except Exception as e:
+                logging.error(f"Error starting next queued item: {e}")
 
 # Add status endpoint to check queue position
 @app.get("/api/queue-status")
@@ -692,6 +742,20 @@ def update_activity():
     """Update the last activity timestamp."""
     global last_activity_time
     last_activity_time = time.time()
+
+# Add memory management
+def clear_gpu_memory():
+    """Clear GPU memory and run garbage collection."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Force garbage collection
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Log memory status
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logging.info(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
 
 # -------------------- MAIN -------------------- #
 if __name__ == "__main__":
