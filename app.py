@@ -383,8 +383,8 @@ def transcribe_vocals(vocals_path: str):
 def process_audio_pipeline(
     audio_file, 
     # htdemucs_ft settings
-    ft_shifts=2, 
-    ft_overlap=0.25
+    ft_shifts=4, 
+    ft_overlap=0.3
 ):
     """
     Master pipeline:
